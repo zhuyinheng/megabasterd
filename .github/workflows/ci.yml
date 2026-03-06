@@ -29,7 +29,7 @@ jobs:
           JAR=$(ls target/MegaBasterd-*-jar-with-dependencies.jar | head -1)
           mkdir -p /tmp/mega_test
           java -jar "$JAR" --cli \
-            --url "https://mega.nz/folder/FxAmhbRJ#Dwugf8isRSR9CCZ6Qnza4w" \
+            --url "https://mega.nz/folder/vzxgwKwL#L4V4JEk1YfWcvC7EG76TMg" \
             --output /tmp/mega_test
           echo "--- downloaded files ---"
           ls -lh /tmp/mega_test
