@@ -11,7 +11,6 @@ package com.tonikelope.megabasterd;
 
 import static com.tonikelope.megabasterd.CryptTools.*;
 import static com.tonikelope.megabasterd.MiscTools.*;
-import java.io.BufferedOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -19,9 +18,19 @@ import java.net.HttpURLConnection;
 import java.net.InetSocketAddress;
 import java.net.Proxy;
 import java.net.URL;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.sql.SQLException;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.crypto.CipherInputStream;
@@ -32,6 +41,8 @@ import javax.crypto.CipherInputStream;
  * Usage:
  *   java -jar MegaBasterd.jar --cli --url <mega-link> --output <dir>
  *                             [--email <email> --password <password>]
+ *                             [--parallel <N>]  (max concurrent file downloads, default 3)
+ *                             [--slots <N>]     (chunk slots per file, default 1)
  *                             [--proxy-host <host> --proxy-port <port>]
  *                             [--proxy-user <user> --proxy-pass <pass>]
  *
@@ -48,21 +59,27 @@ public class CLIMain {
     public static void run(String[] args) {
 
         // ── parse arguments ─────────────────────────────────────────────────
-        String url         = null;
-        String outputDir   = null;
-        String email       = null;
-        String password    = null;
-        String proxyHost   = null;
-        int    proxyPort   = 8080;
-        String proxyUser   = null;
-        String proxyPass   = null;
+        String url              = null;
+        String outputDir        = null;
+        String email            = null;
+        String password         = null;
+        String proxyHost        = null;
+        int    proxyPort        = 8080;
+        String proxyUser        = null;
+        String proxyPass        = null;
+        int    parallelDownloads = 3;
+        int    slots            = 1;
 
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
-                case "--url":    case "-u": if (i + 1 < args.length) url       = args[++i]; break;
-                case "--output": case "-o": if (i + 1 < args.length) outputDir  = args[++i]; break;
-                case "--email":  case "-e": if (i + 1 < args.length) email      = args[++i]; break;
-                case "--password": case "-p": if (i + 1 < args.length) password = args[++i]; break;
+                case "--url":      case "-u": if (i + 1 < args.length) url          = args[++i]; break;
+                case "--output":   case "-o": if (i + 1 < args.length) outputDir    = args[++i]; break;
+                case "--email":    case "-e": if (i + 1 < args.length) email        = args[++i]; break;
+                case "--password": case "-p": if (i + 1 < args.length) password     = args[++i]; break;
+                case "--parallel": case "-n":
+                    if (i + 1 < args.length) { try { parallelDownloads = Math.max(1, Integer.parseInt(args[++i])); } catch (NumberFormatException ignored) {} } break;
+                case "--slots":    case "-s":
+                    if (i + 1 < args.length) { try { slots = Math.max(1, Integer.parseInt(args[++i])); } catch (NumberFormatException ignored) {} } break;
                 case "--proxy-host": if (i + 1 < args.length) proxyHost = args[++i]; break;
                 case "--proxy-port": if (i + 1 < args.length) { try { proxyPort = Integer.parseInt(args[++i]); } catch (NumberFormatException ignored) {} } break;
                 case "--proxy-user": if (i + 1 < args.length) proxyUser = args[++i]; break;
@@ -137,9 +154,10 @@ public class CLIMain {
         // ── dispatch: folder vs single file ──────────────────────────────────
         try {
             if (findFirstRegex("#F!", url, 0) != null) {
-                downloadFolder(api, url, outputDir, proxyHost, proxyPort, proxyUser, proxyPass);
+                downloadFolder(api, url, outputDir, proxyHost, proxyPort, proxyUser, proxyPass,
+                        parallelDownloads, slots);
             } else {
-                downloadUrl(api, url, outputDir, proxyHost, proxyPort, proxyUser, proxyPass);
+                downloadUrl(api, url, outputDir, proxyHost, proxyPort, proxyUser, proxyPass, slots);
             }
         } catch (Exception ex) {
             System.err.println("[ERROR] Download failed: " + ex.getMessage());
@@ -152,7 +170,8 @@ public class CLIMain {
 
     @SuppressWarnings("unchecked")
     private static void downloadFolder(MegaAPI api, String legacyUrl, String outputDir,
-            String proxyHost, int proxyPort, String proxyUser, String proxyPass)
+            String proxyHost, int proxyPort, String proxyUser, String proxyPass,
+            int parallelDownloads, int slots)
             throws Exception {
 
         // #F!FOLDER_ID!FOLDER_KEY
@@ -166,45 +185,78 @@ public class CLIMain {
         System.out.println("[INFO] Fetching folder file tree for folder: " + folderId);
         HashMap<String, Object> nodes = api.getFolderNodes(folderId, folderKey, null, false);
 
-        // count files
+        // collect file nodes
+        List<HashMap<String, Object>> fileNodes = new ArrayList<>();
         long totalSize = 0;
-        int fileCount = 0;
         for (Object val : nodes.values()) {
             HashMap<String, Object> node = (HashMap<String, Object>) val;
             Integer type = (Integer) node.get("type");
             if (type != null && type == 0) {
-                fileCount++;
+                fileNodes.add(node);
                 Object sz = node.get("size");
                 if (sz instanceof Long) totalSize += (Long) sz;
             }
         }
 
-        System.out.printf("[INFO] Found %d file(s) (%s total) in folder.%n", fileCount, formatBytes(totalSize));
+        int fileCount = fileNodes.size();
+        System.out.printf("[INFO] Found %d file(s) (%s total) — parallel=%d  slots=%d%n",
+                fileCount, formatBytes(totalSize), parallelDownloads, slots);
 
-        int idx = 0;
-        for (Map.Entry<String, Object> entry : nodes.entrySet()) {
-            HashMap<String, Object> node = (HashMap<String, Object>) entry.getValue();
-            Integer type = (Integer) node.get("type");
-            if (type == null || type != 0) continue;
+        // ── parallel dispatch ────────────────────────────────────────────────
+        final String finalFolderId  = folderId;
+        final String finalProxyHost = proxyHost;
+        final int    finalProxyPort = proxyPort;
+        final String finalProxyUser = proxyUser;
+        final String finalProxyPass = proxyPass;
+        final int    finalSlots     = slots;
 
+        AtomicLong completedCount = new AtomicLong(0);
+        AtomicReference<Exception> firstError = new AtomicReference<>();
+
+        ExecutorService pool = Executors.newFixedThreadPool(parallelDownloads);
+        List<Future<?>> futures = new ArrayList<>();
+
+        for (int i = 0; i < fileNodes.size(); i++) {
+            HashMap<String, Object> node = fileNodes.get(i);
             String nodeH   = (String) node.get("h");
             String nodeKey = (String) node.get("key");
-            // Construct a node link that getMegaFileMetadata / getMegaFileDownloadUrl understand
-            String nLink = "https://mega.nz/#N!" + nodeH + "!" + nodeKey + "###n=" + folderId;
+            String nLink   = "https://mega.nz/#N!" + nodeH + "!" + nodeKey + "###n=" + finalFolderId;
+            String name    = (String) node.get("name");
+            final int idx  = i + 1;
 
-            idx++;
-            System.out.printf("%n[INFO] (%d/%d) %s%n", idx, fileCount, node.get("name"));
-
-            downloadUrl(api, nLink, outputDir, proxyHost, proxyPort, proxyUser, proxyPass);
+            futures.add(pool.submit(() -> {
+                try {
+                    System.out.printf("%n[INFO] (%d/%d) Starting: %s%n", idx, fileCount, name);
+                    downloadUrl(api, nLink, outputDir,
+                            finalProxyHost, finalProxyPort, finalProxyUser, finalProxyPass, finalSlots);
+                    System.out.printf("%n[INFO] (%d/%d) Done: %s%n",
+                            completedCount.incrementAndGet(), fileCount, name);
+                } catch (Exception ex) {
+                    firstError.compareAndSet(null, ex);
+                    System.err.printf("%n[ERROR] (%d/%d) Failed: %s — %s%n",
+                            idx, fileCount, name, ex.getMessage());
+                }
+            }));
         }
 
-        System.out.printf("%n[INFO] All %d file(s) downloaded to: %s%n", fileCount, new File(outputDir).getAbsolutePath());
+        pool.shutdown();
+        for (Future<?> f : futures) {
+            try { f.get(); } catch (Exception ignored) {}
+        }
+
+        if (firstError.get() != null) {
+            throw firstError.get();
+        }
+
+        System.out.printf("%n[INFO] All %d file(s) downloaded to: %s%n",
+                fileCount, new File(outputDir).getAbsolutePath());
     }
 
-    // ── single-file download ──────────────────────────────────────────────────
+    // ── single-file download (dispatcher) ────────────────────────────────────
 
     private static void downloadUrl(MegaAPI api, String url, String outputDir,
-            String proxyHost, int proxyPort, String proxyUser, String proxyPass)
+            String proxyHost, int proxyPort, String proxyUser, String proxyPass,
+            int slots)
             throws Exception {
 
         // 1. get file metadata
@@ -238,45 +290,111 @@ public class CLIMain {
         byte[] byteKey = initMEGALinkKey(fileKey);
         byte[] byteIV  = initMEGALinkKeyIV(fileKey);
 
-        // 5. chunk-based download with console progress
-        long bytesDownloaded = 0;
-        long chunkId = 1;
-
-        try (BufferedOutputStream bos = new BufferedOutputStream(new FileOutputStream(outFile))) {
-
-            while (bytesDownloaded < fileSize) {
-
-                long chunkOffset = ChunkWriterManager.calculateChunkOffset(chunkId, 1);
-
-                // finished?
-                if (chunkOffset >= fileSize) break;
-
-                long chunkSize = ChunkWriterManager.calculateChunkSize(chunkId, fileSize, chunkOffset, 1);
-
-                // download one chunk with retries
-                bytesDownloaded = downloadChunk(
-                        downloadUrl, chunkOffset, chunkSize,
-                        byteKey, byteIV, bytesDownloaded,
-                        bos, fileSize,
-                        proxyHost, proxyPort, proxyUser, proxyPass);
-
-                chunkId++;
-            }
-
-            bos.flush();
+        // 5. dispatch to single-slot or multi-slot download
+        if (slots <= 1) {
+            downloadSingleSlot(downloadUrl, outFile, fileSize, byteKey, byteIV,
+                    proxyHost, proxyPort, proxyUser, proxyPass);
+        } else {
+            downloadMultiSlot(downloadUrl, outFile, fileSize, byteKey, byteIV,
+                    proxyHost, proxyPort, proxyUser, proxyPass, slots);
         }
 
         System.out.println("\n[INFO] Download complete: " + outFile.getAbsolutePath());
     }
 
-    /**
-     * Downloads a single chunk, retrying on transient errors.
-     * Returns the updated total-bytes-downloaded counter.
-     */
-    private static long downloadChunk(
+    // ── single-slot sequential download ──────────────────────────────────────
+
+    private static void downloadSingleSlot(String downloadUrl, File outFile, long fileSize,
+            byte[] byteKey, byte[] byteIV,
+            String proxyHost, int proxyPort, String proxyUser, String proxyPass)
+            throws Exception {
+
+        AtomicLong bytesDownloaded = new AtomicLong(0);
+        long chunkId = 1;
+
+        try (FileOutputStream fos = new FileOutputStream(outFile);
+             FileChannel channel = fos.getChannel()) {
+
+            while (bytesDownloaded.get() < fileSize) {
+
+                long chunkOffset = ChunkWriterManager.calculateChunkOffset(chunkId, 1);
+                if (chunkOffset >= fileSize) break;
+                long chunkSize = ChunkWriterManager.calculateChunkSize(chunkId, fileSize, chunkOffset, 1);
+
+                downloadChunkToChannel(downloadUrl, chunkOffset, chunkSize, byteKey, byteIV,
+                        channel, bytesDownloaded, fileSize, proxyHost, proxyPort, proxyUser, proxyPass);
+
+                chunkId++;
+            }
+        }
+    }
+
+    // ── multi-slot parallel download ──────────────────────────────────────────
+
+    private static void downloadMultiSlot(String downloadUrl, File outFile, long fileSize,
+            byte[] byteKey, byte[] byteIV,
+            String proxyHost, int proxyPort, String proxyUser, String proxyPass,
+            int slots)
+            throws Exception {
+
+        // 1. pre-calculate all chunks and put them in a work queue
+        ConcurrentLinkedQueue<long[]> queue = new ConcurrentLinkedQueue<>(); // {chunkId, offset, size}
+        for (long chunkId = 1; ; chunkId++) {
+            long offset = ChunkWriterManager.calculateChunkOffset(chunkId, 1);
+            if (offset >= fileSize) break;
+            long size = ChunkWriterManager.calculateChunkSize(chunkId, fileSize, offset, 1);
+            queue.offer(new long[]{chunkId, offset, size});
+        }
+
+        AtomicLong totalDownloaded = new AtomicLong(0);
+        AtomicReference<Exception> firstError = new AtomicReference<>();
+
+        // 2. open the output file once; FileChannel.write(buf, pos) is thread-safe
+        try (FileOutputStream fos = new FileOutputStream(outFile);
+             FileChannel channel = fos.getChannel()) {
+
+            // pre-allocate so seek-writes work correctly
+            channel.write(ByteBuffer.allocate(1), fileSize - 1);
+            channel.force(false);
+
+            // 3. spawn slot threads
+            ExecutorService slotPool = Executors.newFixedThreadPool(slots);
+            List<Future<?>> futures = new ArrayList<>();
+
+            for (int s = 0; s < slots; s++) {
+                futures.add(slotPool.submit(() -> {
+                    long[] chunk;
+                    while ((chunk = queue.poll()) != null && firstError.get() == null) {
+                        try {
+                            downloadChunkToChannel(downloadUrl, chunk[1], chunk[2],
+                                    byteKey, byteIV, channel,
+                                    totalDownloaded, fileSize,
+                                    proxyHost, proxyPort, proxyUser, proxyPass);
+                        } catch (Exception ex) {
+                            firstError.compareAndSet(null, ex);
+                        }
+                    }
+                }));
+            }
+
+            slotPool.shutdown();
+            for (Future<?> f : futures) {
+                try { f.get(); } catch (Exception ignored) {}
+            }
+        }
+
+        if (firstError.get() != null) {
+            throw firstError.get();
+        }
+    }
+
+    // ── chunk download → FileChannel ─────────────────────────────────────────
+
+    private static void downloadChunkToChannel(
             String downloadUrl, long chunkOffset, long chunkSize,
-            byte[] byteKey, byte[] byteIV, long bytesDownloaded,
-            BufferedOutputStream bos, long fileSize,
+            byte[] byteKey, byte[] byteIV,
+            FileChannel channel,
+            AtomicLong totalDownloaded, long fileSize,
             String proxyHost, int proxyPort, String proxyUser, String proxyPass)
             throws Exception {
 
@@ -306,15 +424,14 @@ public class CLIMain {
                 con.setRequestProperty("User-Agent", MainPanel.DEFAULT_USER_AGENT);
 
                 int httpStatus = con.getResponseCode();
-
                 if (httpStatus != 200) {
                     throw new IOException("HTTP " + httpStatus + " for chunk at offset " + chunkOffset);
                 }
 
-                // create AES-CTR cipher positioned at the current stream offset
+                // AES-CTR cipher positioned at the correct stream offset
                 javax.crypto.Cipher cipher = genDecrypter(
                         "AES", "AES/CTR/NoPadding",
-                        byteKey, forwardMEGALinkKeyIV(byteIV, bytesDownloaded));
+                        byteKey, forwardMEGALinkKeyIV(byteIV, chunkOffset));
 
                 byte[] buffer = new byte[MainPanel.DEFAULT_BYTE_BUFFER_SIZE];
 
@@ -323,24 +440,26 @@ public class CLIMain {
                     while (chunkReads < chunkSize
                             && (reads = cis.read(buffer, 0,
                                     (int) Math.min(chunkSize - chunkReads, buffer.length))) != -1) {
-                        bos.write(buffer, 0, reads);
+
+                        ByteBuffer bb = ByteBuffer.wrap(buffer, 0, reads);
+                        // positional write — thread-safe on FileChannel
+                        long pos = chunkOffset + chunkReads;
+                        while (bb.hasRemaining()) {
+                            channel.write(bb, pos + (reads - bb.remaining()));
+                        }
                         chunkReads += reads;
-                        bytesDownloaded += reads;
-                        printProgress(bytesDownloaded, fileSize);
+                        printProgress(totalDownloaded.addAndGet(reads), fileSize);
                     }
                 }
 
-                // success
-                return bytesDownloaded;
+                return; // success
 
             } catch (IOException ex) {
 
-                if (retries >= MAX_RETRIES) {
-                    throw ex;
-                }
+                if (retries >= MAX_RETRIES) throw ex;
 
-                // roll back partial progress
-                bytesDownloaded -= chunkReads;
+                totalDownloaded.addAndGet(-chunkReads);
+                chunkReads = 0;
 
                 long waitSecs = getWaitTimeExpBackOff(++retries);
                 System.err.printf("%n[WARN] Chunk error (%s), retrying in %ds (attempt %d/%d)...%n",
@@ -372,18 +491,21 @@ public class CLIMain {
         System.out.println("Usage:");
         System.out.println("  java -jar MegaBasterd.jar --cli --url <mega-link> --output <dir>");
         System.out.println("       [--email <email> --password <password>]");
+        System.out.println("       [--parallel <N>]  [--slots <N>]");
         System.out.println("       [--proxy-host <host> --proxy-port <port>]");
         System.out.println("       [--proxy-user <user> --proxy-pass <pass>]");
         System.out.println();
         System.out.println("Options:");
-        System.out.println("  -u, --url       MEGA link (file, folder, or file-within-folder link)");
-        System.out.println("  -o, --output    Output directory (default: current directory)");
-        System.out.println("  -e, --email     MEGA account e-mail (optional)");
-        System.out.println("  -p, --password  MEGA account password (optional)");
+        System.out.println("  -u, --url        MEGA link (file, folder, or file-within-folder link)");
+        System.out.println("  -o, --output     Output directory (default: current directory)");
+        System.out.println("  -e, --email      MEGA account e-mail (optional)");
+        System.out.println("  -p, --password   MEGA account password (optional)");
+        System.out.println("  -n, --parallel   Max concurrent file downloads for folder links (default: 3)");
+        System.out.println("  -s, --slots      Parallel chunk connections per file (default: 1)");
         System.out.println("      --proxy-host  HTTP proxy host");
         System.out.println("      --proxy-port  HTTP proxy port (default: 8080)");
         System.out.println("      --proxy-user  Proxy username");
         System.out.println("      --proxy-pass  Proxy password");
-        System.out.println("  -h, --help      Show this help message");
+        System.out.println("  -h, --help       Show this help message");
     }
 }

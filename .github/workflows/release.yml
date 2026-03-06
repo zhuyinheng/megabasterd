@@ -131,7 +131,7 @@ jobs:
           fi
 
           # README
-          printf 'MegaBasterd – MEGA download manager\n\nLinux / macOS:\n  chmod +x MegaBasterd.run\n  ./MegaBasterd.run\n\nWindows:\n  Double-click MegaBasterd.bat\n\nCLI mode:\n  ./MegaBasterd.run --cli --url <mega-link> --output <dir>\n\nTo update: replace jar/MegaBasterd.jar with the new version.\n' \
+          printf 'MegaBasterd – MEGA download manager\n\nLinux / macOS:\n  chmod +x MegaBasterd.run\n  ./MegaBasterd.run\n\nWindows:\n  Double-click MegaBasterd.bat\n\nCLI mode:\n  ./MegaBasterd.run --cli --url <mega-link> --output <dir>\n                   [--email <e> --password <p>]\n                   [--parallel <N>]   max concurrent files   (default: 3)\n                   [--slots    <N>]   chunk slots per file   (default: 1)\n                   [--proxy-host <h> --proxy-port <p>]\n\nTo update: replace jar/MegaBasterd.jar with the new version.\n' \
             > "$BUNDLE/README.txt"
 
       - name: Create archive (tar.gz)
@@ -198,6 +198,8 @@ jobs:
             ```
             ./MegaBasterd.run --cli --url <mega-link> --output <dir>
                               [--email <e> --password <p>]
+                              [--parallel <N>]   max concurrent file downloads (default 3)
+                              [--slots    <N>]   parallel chunk connections per file (default 1)
                               [--proxy-host <h> --proxy-port <p>]
             ```
 
