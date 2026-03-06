@@ -4,29 +4,183 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag (e.g. v8.22)'
+        required: true
+        default: 'v8.22'
 
 permissions:
   contents: write
 
 jobs:
-  build:
+  # ── 1. Build the fat JAR ────────────────────────────────────────────────────
+  build-java:
+    name: Build Java (Maven)
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Build fat JAR
+        run: mvn package -DskipTests
+
+      - name: Get version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag_name }}"
+          else
+            TAG="${{ github.ref_name }}"
+          fi
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: megabasterd-jar
+          path: target/MegaBasterd-*-jar-with-dependencies.jar
+
+  # ── 2. Create Java platform bundles with embedded JRE ──────────────────────
+  package-java:
+    name: Package Java (${{ matrix.platform }})
+    needs: build-java
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - platform: LINUX
+            jre_os: linux
+            jre_arch: x64
+            jre_ext: tar.gz
+          - platform: MACOS
+            jre_os: mac
+            jre_arch: x64
+            jre_ext: tar.gz
+          - platform: MACOS_SILICON
+            jre_os: mac
+            jre_arch: aarch64
+            jre_ext: tar.gz
+          - platform: WINDOWS
+            jre_os: windows
+            jre_arch: x64
+            jre_ext: zip
+          - platform: WINDOWS32
+            jre_os: windows
+            jre_arch: x32
+            jre_ext: zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download JAR artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: megabasterd-jar
+          path: dist-jar
+
+      - name: Download JRE for ${{ matrix.platform }}
+        run: |
+          curl -fL -o jre.${{ matrix.jre_ext }} \
+            "https://api.adoptium.net/v3/binary/latest/11/ga/${{ matrix.jre_os }}/${{ matrix.jre_arch }}/jre/hotspot/normal/eclipse"
+
+      - name: Extract JRE
+        run: |
+          mkdir jre-raw
+          if [ "${{ matrix.jre_ext }}" = "tar.gz" ]; then
+            if [ "${{ matrix.platform }}" = "macos" ]; then
+              tar -xzf jre.tar.gz -C jre-raw --strip-components=3
+            else
+              tar -xzf jre.tar.gz -C jre-raw --strip-components=1
+            fi
+          else
+            unzip -q jre.zip -d jre-raw
+            INNER=$(ls jre-raw | head -1)
+            mv "jre-raw/$INNER" jre-inner
+            rm -rf jre-raw
+            mv jre-inner jre-raw
+          fi
+
+          if [ -d "jre-raw/Contents/Home" ]; then
+            mv jre-raw jre-outer
+            mv jre-outer/Contents/Home jre-raw
+            rm -rf jre-outer
+          fi
+
+          if [ "${{ matrix.jre_os }}" = "windows" ]; then
+            ls jre-raw/bin/java.exe
+          else
+            ls jre-raw/bin/java
+          fi
+
+      - name: Assemble bundle
+        run: |
+          VERSION="${{ needs.build-java.outputs.version }}"
+          BUNDLE="MegaBasterd${{ matrix.platform }}"
+          mkdir -p "$BUNDLE/jar" "$BUNDLE/jre"
+
+          cp dist-jar/*.jar "$BUNDLE/jar/MegaBasterd.jar"
+          cp -r jre-raw/. "$BUNDLE/jre/"
+
+          if [[ "${{ matrix.platform }}" != WINDOWS* ]]; then
+            printf '#!/bin/sh\nDIR="$(cd "$(dirname "$0")" && pwd)"\n"$DIR/jre/bin/java" -jar "$DIR/jar/MegaBasterd.jar" "$@"\n' \
+              > "$BUNDLE/MegaBasterd.run"
+            chmod +x "$BUNDLE/MegaBasterd.run"
+          fi
+
+          if [[ "${{ matrix.platform }}" == WINDOWS* ]]; then
+            printf '@echo off\r\ncd /d "%%~dp0"\r\njre\\bin\\java -jar jar\\MegaBasterd.jar %%*\r\n' \
+              > "$BUNDLE/MegaBasterd.bat"
+          fi
+
+          printf 'MegaBasterd – MEGA download manager\n\nLinux / macOS:\n  chmod +x MegaBasterd.run\n  ./MegaBasterd.run\n\nWindows:\n  Double-click MegaBasterd.bat\n\nCLI mode:\n  ./MegaBasterd.run --cli --url <mega-link> --output <dir>\n                   [--email <e> --password <p>]\n                   [--parallel <N>]   max concurrent files   (default: 3)\n                   [--slots    <N>]   chunk slots per file   (default: 1)\n                   [--proxy-host <h> --proxy-port <p>]\n\nTo update: replace jar/MegaBasterd.jar with the new version.\n' \
+            > "$BUNDLE/README.txt"
+
+          printf 'MegaBasterd – Gestor de descargas de MEGA\n\nLinux / macOS:\n  chmod +x MegaBasterd.run\n  ./MegaBasterd.run\n\nWindows:\n  Doble clic en MegaBasterd.bat\n\nModo CLI:\n  ./MegaBasterd.run --cli --url <enlace-mega> --output <dir>\n\nPara actualizar: reemplaza jar/MegaBasterd.jar con la nueva versión.\n' \
+            > "$BUNDLE/LEEME.txt"
+
+      - name: Create archive
+        run: |
+          VERSION="${{ needs.build-java.outputs.version }}"
+          BUNDLE="MegaBasterd${{ matrix.platform }}"
+          zip -r "MegaBasterd${{ matrix.platform }}_${VERSION}_portable.zip" "$BUNDLE"
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.platform }}
+          path: MegaBasterd${{ matrix.platform }}_${{ needs.build-java.outputs.version }}_portable.zip
+
+  # ── 3. Build Rust CLI binaries ──────────────────────────────────────────────
+  build-rust:
+    name: Build Rust (${{ matrix.artifact }})
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: rust_tool
     strategy:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact: megabasterd-linux-x86_64
+            artifact: megabasterd-cli-linux-x86_64
           - target: x86_64-apple-darwin
             os: macos-latest
-            artifact: megabasterd-macos-x86_64
+            artifact: megabasterd-cli-macos-x86_64
           - target: aarch64-apple-darwin
             os: macos-latest
-            artifact: megabasterd-macos-aarch64
-
-    runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        working-directory: rust_tool
+            artifact: megabasterd-cli-macos-aarch64
 
     steps:
       - uses: actions/checkout@v4
@@ -50,7 +204,7 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package (Unix)
+      - name: Package
         run: |
           cd target/${{ matrix.target }}/release
           tar czf ../../../${{ matrix.artifact }}.tar.gz megabasterd
@@ -62,20 +216,80 @@ jobs:
           name: ${{ matrix.artifact }}
           path: rust_tool/${{ matrix.artifact }}.tar.gz
 
+  # ── 4. Publish GitHub Release ───────────────────────────────────────────────
   release:
-    needs: build
+    name: Create GitHub Release
+    needs: [build-java, package-java, build-rust]
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - name: Download all artifacts
+    steps:
+      - name: Download all Java bundles
         uses: actions/download-artifact@v4
         with:
-          path: artifacts
+          pattern: bundle-*
           merge-multiple: true
+          path: release-files
+
+      - name: Download standalone JAR
+        uses: actions/download-artifact@v4
+        with:
+          name: megabasterd-jar
+          path: jar-raw
+
+      - name: Rename standalone JAR
+        run: |
+          VERSION="${{ needs.build-java.outputs.version }}"
+          cp jar-raw/*.jar "release-files/MegaBasterd_${VERSION}.jar"
+
+      - name: Download all Rust binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: megabasterd-cli-*
+          merge-multiple: true
+          path: release-files
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
-          files: artifacts/*
+          name: MegaBasterd ${{ needs.build-java.outputs.tag }}
+          tag_name: ${{ needs.build-java.outputs.tag }}
+          body: |
+            ## MegaBasterd ${{ needs.build-java.outputs.version }}
+
+            ### Java GUI/CLI – platform bundles with embedded JRE 11 (no Java installation required)
+
+            | Platform | File |
+            |----------|------|
+            | Linux x64 | `MegaBasterdLINUX_${{ needs.build-java.outputs.version }}_portable.zip` |
+            | macOS x64 (Intel) | `MegaBasterdMACOS_${{ needs.build-java.outputs.version }}_portable.zip` |
+            | macOS ARM64 (Apple Silicon) | `MegaBasterdMACOS_SILICON_${{ needs.build-java.outputs.version }}_portable.zip` |
+            | Windows x64 | `MegaBasterdWINDOWS_${{ needs.build-java.outputs.version }}_portable.zip` |
+            | Windows x86 | `MegaBasterdWINDOWS32_${{ needs.build-java.outputs.version }}_portable.zip` |
+            | Standalone JAR (requires Java 11+) | `MegaBasterd_${{ needs.build-java.outputs.version }}.jar` |
+
+            ### Rust CLI binaries (no JRE required)
+
+            | Platform | File |
+            |----------|------|
+            | Linux x64 | `megabasterd-cli-linux-x86_64.tar.gz` |
+            | macOS x64 (Intel) | `megabasterd-cli-macos-x86_64.tar.gz` |
+            | macOS ARM64 (Apple Silicon) | `megabasterd-cli-macos-aarch64.tar.gz` |
+
+            ### Usage
+
+            **Java bundle (Linux/macOS):**
+            ```
+            unzip MegaBasterdLINUX_${{ needs.build-java.outputs.version }}_portable.zip
+            cd MegaBasterdLINUX
+            chmod +x MegaBasterd.run
+            ./MegaBasterd.run
+            ```
+
+            **Rust CLI:**
+            ```
+            tar xzf megabasterd-cli-linux-x86_64.tar.gz
+            ./megabasterd --url <mega-link> --output <dir>
+            ```
+          files: release-files/*
+          draft: false
+          prerelease: false
