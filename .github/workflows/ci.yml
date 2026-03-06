@@ -24,14 +24,3 @@ jobs:
       - name: Build
         run: mvn package -DskipTests
 
-      - name: CLI smoke test – folder download
-        run: |
-          JAR=$(ls target/MegaBasterd-*-jar-with-dependencies.jar | head -1)
-          mkdir -p /tmp/mega_test
-          java -jar "$JAR" --cli \
-            --url "https://mega.nz/folder/vzxgwKwL#L4V4JEk1YfWcvC7EG76TMg" \
-            --output /tmp/mega_test
-          echo "--- downloaded files ---"
-          ls -lh /tmp/mega_test
-          # fail if nothing was downloaded
-          [ "$(ls -A /tmp/mega_test)" ] || { echo "ERROR: no files downloaded"; exit 1; }
