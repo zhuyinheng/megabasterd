@@ -1,7 +1,7 @@
 use aes::Aes128;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use cbc::Decryptor as CbcDecryptor;
-use cipher::{block_padding::NoPadding, BlockDecryptMut, KeyIvInit, StreamCipher};
+use cipher::{block_padding::NoPadding, BlockDecrypt, BlockDecryptMut, KeyInit, KeyIvInit, StreamCipher};
 use ctr::Ctr128BE;
 
 /// Decode MEGA's URL-safe base64 (no padding).
@@ -92,6 +92,22 @@ pub fn decrypt_chunk(data: &mut [u8], key: &[u8; 16], nonce: &[u8; 8], chunk_off
 
     let mut cipher = Ctr128BE::<Aes128>::new(key.into(), &iv.into());
     cipher.apply_keystream(data);
+}
+
+/// Decrypt a MEGA folder file key using the folder share key (AES-128-ECB).
+///
+/// Each file node in a folder has its raw key encrypted with the folder's share key.
+/// The raw key (32 bytes for files) is then processed with `derive_key` / `derive_nonce`.
+pub fn decrypt_folder_file_key(enc_key: &[u8], folder_key: &[u8; 16]) -> Result<Vec<u8>, String> {
+    if enc_key.is_empty() || enc_key.len() % 16 != 0 {
+        return Err(format!("Invalid encrypted key length: {}", enc_key.len()));
+    }
+    let cipher = Aes128::new(cipher::generic_array::GenericArray::from_slice(folder_key));
+    let mut result = enc_key.to_vec();
+    for chunk in result.chunks_exact_mut(16) {
+        cipher.decrypt_block(cipher::generic_array::GenericArray::from_mut_slice(chunk));
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
