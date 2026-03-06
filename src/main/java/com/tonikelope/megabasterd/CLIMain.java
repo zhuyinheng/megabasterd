@@ -20,6 +20,8 @@ import java.net.InetSocketAddress;
 import java.net.Proxy;
 import java.net.URL;
 import java.sql.SQLException;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.crypto.CipherInputStream;
@@ -80,6 +82,11 @@ public class CLIMain {
             outputDir = ".";
         }
 
+        // ── normalise new-style MEGA URLs to legacy format ───────────────────
+        // e.g. https://mega.nz/folder/ID#KEY  →  https://mega.nz/#F!ID!KEY
+        //      https://mega.nz/file/ID#KEY    →  https://mega.nz/#!ID!KEY
+        url = newMegaLinks2Legacy(url).trim();
+
         // ── initialise SQLite (loads saved proxy / API-key settings) ─────────
         try {
             DBTools.setupSqliteTables();
@@ -127,9 +134,13 @@ public class CLIMain {
             }
         }
 
-        // ── download ─────────────────────────────────────────────────────────
+        // ── dispatch: folder vs single file ──────────────────────────────────
         try {
-            downloadUrl(api, url, outputDir, proxyHost, proxyPort, proxyUser, proxyPass);
+            if (findFirstRegex("#F!", url, 0) != null) {
+                downloadFolder(api, url, outputDir, proxyHost, proxyPort, proxyUser, proxyPass);
+            } else {
+                downloadUrl(api, url, outputDir, proxyHost, proxyPort, proxyUser, proxyPass);
+            }
         } catch (Exception ex) {
             System.err.println("[ERROR] Download failed: " + ex.getMessage());
             LOG.log(Level.SEVERE, ex.getMessage(), ex);
@@ -137,7 +148,60 @@ public class CLIMain {
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
+    // ── folder download ───────────────────────────────────────────────────────
+
+    @SuppressWarnings("unchecked")
+    private static void downloadFolder(MegaAPI api, String legacyUrl, String outputDir,
+            String proxyHost, int proxyPort, String proxyUser, String proxyPass)
+            throws Exception {
+
+        // #F!FOLDER_ID!FOLDER_KEY
+        String folderId  = findFirstRegex("#F!([^!@]+)", legacyUrl, 1);
+        String folderKey = findFirstRegex("#F![^!]+!([^!\\s]+)", legacyUrl, 1);
+
+        if (folderId == null || folderKey == null) {
+            throw new Exception("Could not parse folder ID/key from: " + legacyUrl);
+        }
+
+        System.out.println("[INFO] Fetching folder file tree for folder: " + folderId);
+        HashMap<String, Object> nodes = api.getFolderNodes(folderId, folderKey, null, false);
+
+        // count files
+        long totalSize = 0;
+        int fileCount = 0;
+        for (Object val : nodes.values()) {
+            HashMap<String, Object> node = (HashMap<String, Object>) val;
+            Integer type = (Integer) node.get("type");
+            if (type != null && type == 0) {
+                fileCount++;
+                Object sz = node.get("size");
+                if (sz instanceof Long) totalSize += (Long) sz;
+            }
+        }
+
+        System.out.printf("[INFO] Found %d file(s) (%s total) in folder.%n", fileCount, formatBytes(totalSize));
+
+        int idx = 0;
+        for (Map.Entry<String, Object> entry : nodes.entrySet()) {
+            HashMap<String, Object> node = (HashMap<String, Object>) entry.getValue();
+            Integer type = (Integer) node.get("type");
+            if (type == null || type != 0) continue;
+
+            String nodeH   = (String) node.get("h");
+            String nodeKey = (String) node.get("key");
+            // Construct a node link that getMegaFileMetadata / getMegaFileDownloadUrl understand
+            String nLink = "https://mega.nz/#N!" + nodeH + "!" + nodeKey + "###n=" + folderId;
+
+            idx++;
+            System.out.printf("%n[INFO] (%d/%d) %s%n", idx, fileCount, node.get("name"));
+
+            downloadUrl(api, nLink, outputDir, proxyHost, proxyPort, proxyUser, proxyPass);
+        }
+
+        System.out.printf("%n[INFO] All %d file(s) downloaded to: %s%n", fileCount, new File(outputDir).getAbsolutePath());
+    }
+
+    // ── single-file download ──────────────────────────────────────────────────
 
     private static void downloadUrl(MegaAPI api, String url, String outputDir,
             String proxyHost, int proxyPort, String proxyUser, String proxyPass)
@@ -312,7 +376,7 @@ public class CLIMain {
         System.out.println("       [--proxy-user <user> --proxy-pass <pass>]");
         System.out.println();
         System.out.println("Options:");
-        System.out.println("  -u, --url       MEGA link (file or folder file link)");
+        System.out.println("  -u, --url       MEGA link (file, folder, or file-within-folder link)");
         System.out.println("  -o, --output    Output directory (default: current directory)");
         System.out.println("  -e, --email     MEGA account e-mail (optional)");
         System.out.println("  -p, --password  MEGA account password (optional)");
