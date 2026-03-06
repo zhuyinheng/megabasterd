@@ -1,0 +1,59 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 8
+        uses: actions/setup-java@v4
+        with:
+          java-version: '8'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Build fat JAR
+        run: mvn package -DskipTests
+
+      - name: Find JAR
+        id: find_jar
+        run: |
+          JAR=$(ls target/MegaBasterd-*-jar-with-dependencies.jar | head -1)
+          echo "jar_path=$JAR" >> "$GITHUB_OUTPUT"
+          echo "jar_name=$(basename $JAR)" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: MegaBasterd ${{ github.ref_name }}
+          body: |
+            ## MegaBasterd ${{ github.ref_name }}
+
+            ### Download
+            Download `${{ steps.find_jar.outputs.jar_name }}` below.
+
+            ### Usage
+
+            **GUI mode (default):**
+            ```
+            java -jar ${{ steps.find_jar.outputs.jar_name }}
+            ```
+
+            **CLI mode:**
+            ```
+            java -jar ${{ steps.find_jar.outputs.jar_name }} --cli --url <mega-link> --output <dir>
+                 [--email <email> --password <password>]
+                 [--proxy-host <host> --proxy-port <port>]
+                 [--proxy-user <user> --proxy-pass <pass>]
+            ```
+          files: ${{ steps.find_jar.outputs.jar_path }}
+          draft: false
+          prerelease: false
