@@ -149,7 +149,7 @@ jobs:
             > "$BUNDLE/README.txt"
 
           # LEEME (Spanish readme)
-          printf 'MegaBasterd – Gestor de descargas de MEGA\n\nLinux / macOS:\n  chmod +x MegaBasterd.run\n  ./MegaBasterd.run\n\nWindows:\n  Doble clic en MegaBasterd.bat\n\nModo CLI:\n  ./MegaBasterd.run --cli --url <enlace-mega> --output <dir>\n\nPara actualizar: reemplaza jar/MegaBasterd.jar con la nueva version.\n' \
+          printf 'MegaBasterd – Gestor de descargas de MEGA\n\nLinux / macOS:\n  chmod +x MegaBasterd.run\n  ./MegaBasterd.run\n\nWindows:\n  Doble clic en MegaBasterd.bat\n\nModo CLI:\n  ./MegaBasterd.run --cli --url <enlace-mega> --output <dir>\n\nPara actualizar: reemplaza jar/MegaBasterd.jar con la nueva versión.\n' \
             > "$BUNDLE/LEEME.txt"
 
       - name: Create archive
