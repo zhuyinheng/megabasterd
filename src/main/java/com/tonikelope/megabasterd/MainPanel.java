@@ -106,6 +106,14 @@ public final class MainPanel {
 
     public static void main(String args[]) {
 
+        // ── CLI mode detection ───────────────────────────────────────────────
+        for (String arg : args) {
+            if ("--cli".equals(arg)) {
+                CLIMain.run(args);
+                return;
+            }
+        }
+
         if (args.length > 0) {
 
             if (args.length > 1) {
@@ -201,6 +209,18 @@ public final class MainPanel {
 
     public static SmartMegaProxyManager getProxy_manager() {
         return _proxy_manager;
+    }
+
+    /**
+     * Convenience method used by CLI mode to inject proxy settings into the
+     * static fields read by MegaAPI and the chunk downloaders.
+     */
+    public static void setProxySettings(String host, int port, String user, String pass, boolean enable) {
+        _proxy_host = host;
+        _proxy_port = port;
+        _proxy_user = user;
+        _proxy_pass = pass;
+        _use_proxy  = enable;
     }
 
     private volatile MainPanelView _view;
