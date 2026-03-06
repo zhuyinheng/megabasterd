@@ -86,7 +86,13 @@ jobs:
         run: |
           mkdir jre-raw
           if [ "${{ matrix.jre_ext }}" = "tar.gz" ]; then
-            tar -xzf jre.tar.gz -C jre-raw --strip-components=1
+            # macOS Adoptium JRE tarballs nest the runtime under Contents/Home/
+            # (app-bundle layout), so strip 3 components instead of 1.
+            if [ "${{ matrix.platform }}" = "macos" ]; then
+              tar -xzf jre.tar.gz -C jre-raw --strip-components=3
+            else
+              tar -xzf jre.tar.gz -C jre-raw --strip-components=1
+            fi
           else
             unzip -q jre.zip -d jre-raw
             INNER=$(ls jre-raw | head -1)
